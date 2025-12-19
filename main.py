@@ -1,25 +1,24 @@
 """jarvis_basic.py
 
-Basic Jarvis-style assistant (voice optional).
+Basic Jarvis-style assistant (Replit-friendly).
 
-Changes requested:
-- TTS reliability on Replit: pyttsx3 often cannot output audio in hosted sandboxes.
-  This version:
-  - tries pyttsx3
-  - if it fails, falls back to a "print-only" mode (no crash)
-  - optional: gTTS-based audio file generation (may or may not play in Replit)
+Fix for "When I write a message the AI doesn't reply":
+- In the prior versions, if WAKE_WORD_ENABLED=True and you typed a message WITHOUT
+  the wake word, the assistant ignored it (continued the loop), so it looked like
+  it wasn't responding.
 
-- Greetings:
-  If you say "hello" or "hello how are you" (or any phrase starting with "hello"),
-  it responds: "Hello sir, how can I help you today?"
+This version:
+- For typed input (stdin), the wake word is NOT required.
+- For microphone/scripted input, wake word rules still apply (configurable).
 
-- Notes:
-  - One notes file per day (YYYY-MM-DD.txt)
-  - Each note is appended with a timestamp
-  - When you save a note, it confirms by repeating the note text (no filename)
+Requested behaviors:
+- Greeting: "hello" or anything starting with "hello" ->
+  "Hello sir, how can I help you today?"
+- Notes: 1 file per day (YYYY-MM-DD.txt), append timestamped lines.
+  Save confirmation repeats the note text (no filename).
 
-Non-interactive environments:
-- If stdin is not interactive, you can supply commands via env var JARVIS_COMMANDS:
+Non-interactive use:
+- Provide commands via env var JARVIS_COMMANDS (semicolon-separated):
   JARVIS_COMMANDS="jarvis hello; jarvis note buy milk; jarvis notes; jarvis exit" python jarvis_basic.py
 
 Run tests:
@@ -102,13 +101,6 @@ class Response:
     detail: Optional[str] = None
 
 
-def _stdin_is_interactive() -> bool:
-    try:
-        return sys.stdin is not None and sys.stdin.isatty()
-    except Exception:
-        return False
-
-
 def _format_time(dt: datetime) -> str:
     return dt.strftime("%I:%M %p").lstrip("0")
 
@@ -116,6 +108,25 @@ def _format_time(dt: datetime) -> str:
 def _format_date(dt: datetime) -> str:
     day = str(dt.day)
     return dt.strftime(f"%A, %B {day}, %Y")
+
+
+def _read_stdin_line(prompt: str = "YOU: ") -> str:
+    """Read a line from stdin safely.
+
+    Replit and other sandboxes can be weird with stdin.
+    We try input() first, then fall back to sys.stdin.readline().
+    """
+    try:
+        return input(prompt)
+    except (OSError, EOFError):
+        pass
+
+    try:
+        sys.stdout.write(prompt)
+        sys.stdout.flush()
+        return sys.stdin.readline()
+    except Exception:
+        return ""
 
 
 # -----------------------------
@@ -139,7 +150,6 @@ class Speaker:
         try:
             self.engine = pyttsx3.init()
             self.engine.setProperty("rate", 185)
-            # Quick self-test (some environments initialize but fail on run)
             self.engine.say("")
             self.engine.runAndWait()
             self.pyttsx3_ok = True
@@ -147,7 +157,6 @@ class Speaker:
             self.engine = None
             self.pyttsx3_ok = False
             if self.mode in {"auto", "pyttsx3"}:
-                # In Replit/sandboxes this often fails; fall back cleanly.
                 self.mode = "print"
 
     def _say_with_pyttsx3(self, text: str) -> None:
@@ -157,20 +166,16 @@ class Speaker:
             self.engine.say(text)
             self.engine.runAndWait()
         except Exception:
-            # If it fails mid-run, permanently fall back.
             self.pyttsx3_ok = False
             self.mode = "print"
 
     def _say_with_gtts(self, text: str) -> None:
         if gTTS is None:
-            # Can't use gTTS; just print.
             return
         try:
-            # Write to a temp mp3 file and try to open it.
             with tempfile.NamedTemporaryFile(delete=False, suffix=".mp3") as f:
                 fp = f.name
             gTTS(text=text, lang="en").save(fp)
-            # Attempt to open default player (may not play in some sandboxes).
             try:
                 webbrowser.open(f"file://{fp}")
             except Exception:
@@ -187,8 +192,6 @@ class Speaker:
         if self.mode == "gtts":
             self._say_with_gtts(text)
             return
-
-        # auto/pyttsx3
         self._say_with_pyttsx3(text)
 
 
@@ -216,14 +219,13 @@ class Listener:
         self._script_idx += 1
         return cmd.strip().lower()
 
-    def listen(self) -> str:
-        # 1) Scripted commands
+    def listen(self) -> tuple[str, str]:
+        """Return (text, source) where source is one of: scripted, mic, stdin."""
         scripted = self._next_scripted()
         if scripted:
             print(f"YOU: {scripted}")
-            return scripted
+            return scripted, "scripted"
 
-        # 2) Microphone
         if not TEXT_ONLY_MODE and self.recognizer is not None and self.microphone is not None:
             with self.microphone as source:
                 self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
@@ -231,18 +233,12 @@ class Listener:
 
             try:
                 text = self.recognizer.recognize_google(audio)
-                return text.strip().lower()
+                return text.strip().lower(), "mic"
             except Exception:
-                return ""
+                return "", "mic"
 
-        # 3) stdin
-        if not _stdin_is_interactive():
-            return ""
-
-        try:
-            return input("YOU: ").strip().lower()
-        except (OSError, EOFError):
-            return ""
+        line = _read_stdin_line("YOU: ")
+        return line.strip().lower(), "stdin"
 
 
 # -----------------------------
@@ -253,7 +249,6 @@ CommandHandler = Callable[[str], Optional[Response]]
 
 
 def cmd_greeting(text: str) -> Optional[Response]:
-    # Match: "hello", "hello how are you", "hello jarvis" etc.
     if not text.startswith("hello"):
         return None
     return Response(spoken="Hello sir, how can I help you today?")
@@ -382,7 +377,6 @@ def cmd_show_notes(_: str) -> Response:
     if not txt:
         return Response(spoken="You have no notes for today.")
 
-    # Speak a short summary; show full text in detail
     lines = txt.splitlines()
     summary = f"You have {len(lines)} note{'s' if len(lines) != 1 else ''} for today."
     return Response(spoken=summary, detail=txt)
@@ -466,6 +460,13 @@ def strip_wake_word(raw: str) -> tuple[bool, str]:
     return False, t
 
 
+def _should_require_wake_word(source: str) -> bool:
+    """Wake word is not required for typed input (stdin)."""
+    if not WAKE_WORD_ENABLED:
+        return False
+    return source != "stdin"
+
+
 def _load_scripted_commands_from_env() -> list[str]:
     raw = os.environ.get(JARVIS_COMMANDS_ENV, "")
     if not raw.strip():
@@ -478,23 +479,14 @@ def main() -> int:
     scripted = _load_scripted_commands_from_env()
     listener = Listener(scripted_commands=scripted)
 
-    # If we have no scripted commands and no interactive stdin and no mic, exit cleanly.
-    if not scripted and TEXT_ONLY_MODE and not _stdin_is_interactive():
-        speaker.say(
-            "No interactive input is available. Set JARVIS_COMMANDS to run scripted commands, "
-            "or run this in a normal terminal."
-        )
-        return 2
-
     if speaker.mode == "print" and TTS_MODE != "print":
         print("[Info] TTS is unavailable in this environment; using print-only responses.")
 
     speaker.say("Online. Say 'help' for commands.")
 
     while True:
-        raw = listener.listen()
+        raw, source = listener.listen()
 
-        # If nothing was captured and we were in scripted mode, end.
         if not raw:
             if scripted and listener._script_idx >= len(scripted):
                 break
@@ -502,7 +494,9 @@ def main() -> int:
 
         has_wake, text = strip_wake_word(raw)
 
-        if WAKE_WORD_ENABLED and not has_wake:
+        if _should_require_wake_word(source) and not has_wake:
+            # Previously this was silently ignored. Now we reply with a hint.
+            speaker.say(f"Say '{WAKE_WORD} ...' first.")
             continue
 
         if not text:
@@ -557,6 +551,12 @@ def _run_tests() -> int:
             self.assertEqual(strip_wake_word("hey jarvis time"), (True, "time"))
             self.assertEqual(strip_wake_word("jarvis"), (True, ""))
             self.assertEqual(strip_wake_word("time"), (False, "time"))
+
+        def test_wake_not_required_for_stdin(self) -> None:
+            self.assertFalse(_should_require_wake_word("stdin"))
+
+        def test_wake_required_for_mic(self) -> None:
+            self.assertTrue(_should_require_wake_word("mic"))
 
     class TestNotesFilePerDay(unittest.TestCase):
         def test_notes_path(self) -> None:
