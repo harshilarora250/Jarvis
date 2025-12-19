@@ -2,11 +2,19 @@
 
 A basic, local Jarvis-style assistant.
 
+Why you saw an error
+- Some sandboxed environments have no interactive stdin. Calling input() can raise:
+  OSError: [Errno 29] I/O error
+
+This version fixes that by:
+- Detecting non-interactive stdin and handling input() failures gracefully
+- Providing a non-interactive mode via env var JARVIS_COMMANDS
+
 Features (basic for now):
 - Wake word (optional): "jarvis" (can be disabled)
-- Speech-to-text (optional) using SpeechRecognition (Google Web Speech, free but requires internet)
+- Speech-to-text (optional) using SpeechRecognition (Google Web Speech, requires internet)
 - Text-to-speech using pyttsx3 (offline)
-- Simple command router:
+- Simple commands:
   - open websites
   - tell time/date
   - quick math
@@ -15,32 +23,29 @@ Features (basic for now):
   - run shell commands (opt-in allowlist)
 
 How to run:
-1) Install dependencies:
-   pip install pyttsx3 SpeechRecognition pyaudio python-dateutil
+1) Install dependencies (voice output/input optional):
+   pip install pyttsx3 SpeechRecognition pyaudio
 
    Notes:
    - On macOS, PyAudio install can be tricky. If pip fails:
-     brew install portaudio
-     pip install pyaudio
-   - If you don't want voice input, you can run in text-only mode.
+       brew install portaudio
+       pip install pyaudio
+   - If you don't want voice input, set TEXT_ONLY_MODE=True.
 
-2) Run:
+2) Run interactively:
    python jarvis_basic.py
 
-Security:
-- This script includes an optional shell-command feature.
-  It is disabled by default and only allows a small allowlist when enabled.
+3) Run non-interactively (no stdin available):
+   # Semicolon-separated commands. Wake word is optional depending on WAKE_WORD_ENABLED.
+   JARVIS_COMMANDS="jarvis time; jarvis calculate 12*7; jarvis note buy milk; jarvis exit" python jarvis_basic.py
 
-You can extend this later with:
-- OpenAI/other LLM integration
-- reminders, calendar, email
-- custom skills/plugins
+Security:
+- Optional shell-command feature is disabled by default and uses an allowlist when enabled.
 """
 
 from __future__ import annotations
 
 import math
-import os
 import re
 import shlex
 import subprocess
@@ -49,7 +54,8 @@ import webbrowser
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Optional, Tuple
+from urllib.parse import quote_plus
 
 try:
     import pyttsx3
@@ -70,7 +76,7 @@ except Exception:
 WAKE_WORD_ENABLED = True
 WAKE_WORD = "jarvis"
 
-TEXT_ONLY_MODE = False  # Set True to disable microphone and type commands.
+TEXT_ONLY_MODE = False  # Set True to disable microphone and (normally) type commands.
 
 NOTES_DIR = Path.home() / ".jarvis_notes"
 NOTES_DIR.mkdir(parents=True, exist_ok=True)
@@ -84,6 +90,10 @@ ALLOWED_SHELL_COMMANDS = {
     "whoami",
     "date",
 }
+
+# If stdin isn't interactive, we can still run scripted commands from this env var.
+# Example: JARVIS_COMMANDS="jarvis time; jarvis exit"
+JARVIS_COMMANDS_ENV = "JARVIS_COMMANDS"
 
 
 # -----------------------------
@@ -119,10 +129,22 @@ class Speaker:
             pass
 
 
+def _stdin_is_interactive() -> bool:
+    try:
+        return sys.stdin is not None and sys.stdin.isatty()
+    except Exception:
+        return False
+
+
 class Listener:
-    def __init__(self) -> None:
+    """Gets user input from either microphone, stdin, or scripted env commands."""
+
+    def __init__(self, scripted_commands: Optional[list[str]] = None) -> None:
         self.recognizer = None
         self.microphone = None
+        self.scripted_commands = scripted_commands or []
+        self._script_idx = 0
+
         if sr is not None and not TEXT_ONLY_MODE:
             try:
                 self.recognizer = sr.Recognizer()
@@ -131,21 +153,48 @@ class Listener:
                 self.recognizer = None
                 self.microphone = None
 
-    def listen(self) -> str:
-        """Return recognized text (lowercased). Falls back to typed input."""
-        if TEXT_ONLY_MODE or self.recognizer is None or self.microphone is None:
-            return input("YOU: ").strip().lower()
+    def _next_scripted(self) -> str:
+        if self._script_idx >= len(self.scripted_commands):
+            return ""
+        cmd = self.scripted_commands[self._script_idx]
+        self._script_idx += 1
+        return cmd.strip().lower()
 
-        with self.microphone as source:
-            self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
-            audio = self.recognizer.listen(source, timeout=None, phrase_time_limit=8)
+    def listen(self) -> str:
+        """Return recognized text (lowercased).
+
+        Order:
+        1) If scripted commands were provided, consume them first.
+        2) If mic is available and not TEXT_ONLY_MODE, use speech recognition.
+        3) Else try stdin (input). If stdin isn't available, return empty string.
+        """
+
+        # 1) Scripted commands
+        scripted = self._next_scripted()
+        if scripted:
+            print(f"YOU: {scripted}")
+            return scripted
+
+        # 2) Microphone
+        if not TEXT_ONLY_MODE and self.recognizer is not None and self.microphone is not None:
+            with self.microphone as source:
+                self.recognizer.adjust_for_ambient_noise(source, duration=0.5)
+                audio = self.recognizer.listen(source, timeout=None, phrase_time_limit=8)
+
+            try:
+                text = self.recognizer.recognize_google(audio)
+                return text.strip().lower()
+            except Exception:
+                return ""
+
+        # 3) stdin
+        if not _stdin_is_interactive():
+            # No stdin available; caller can decide what to do.
+            return ""
 
         try:
-            text = self.recognizer.recognize_google(audio)
-            return text.strip().lower()
-        except sr.UnknownValueError:
-            return ""
-        except Exception:
+            return input("YOU: ").strip().lower()
+        except (OSError, EOFError):
             return ""
 
 
@@ -165,14 +214,25 @@ def cmd_help(_: str) -> Response:
     )
 
 
+def _format_time(dt: datetime) -> str:
+    # Cross-platform (Windows doesn't support %-I)
+    return dt.strftime("%I:%M %p").lstrip("0")
+
+
+def _format_date(dt: datetime) -> str:
+    # Cross-platform (Windows doesn't support %-d)
+    day = str(dt.day)
+    return dt.strftime(f"%A, %B {day}, %Y")
+
+
 def cmd_time(_: str) -> Response:
     now = datetime.now()
-    return Response(spoken=f"It is {now.strftime('%-I:%M %p')}.")
+    return Response(spoken=f"It is {_format_time(now)}.")
 
 
 def cmd_date(_: str) -> Response:
     now = datetime.now()
-    return Response(spoken=f"Today is {now.strftime('%A, %B %-d, %Y')}.")
+    return Response(spoken=f"Today is {_format_date(now)}.")
 
 
 def cmd_open(text: str) -> Optional[Response]:
@@ -212,8 +272,11 @@ def cmd_search(text: str) -> Optional[Response]:
     if not m:
         return None
     query = m.group(2).strip()
-    url = "https://www.google.com/search?q=" + webbrowser.quote(query) if hasattr(webbrowser, "quote") else "https://www.google.com/search?q=" + query.replace(" ", "+")
-    webbrowser.open(url)
+    url = "https://www.google.com/search?q=" + quote_plus(query)
+    try:
+        webbrowser.open(url)
+    except Exception:
+        pass
     return Response(spoken=f"Searching for {query}.")
 
 
@@ -234,8 +297,8 @@ def safe_eval_math(expr: str) -> float:
     if not expr:
         raise ValueError("Empty expression")
 
-    # Block obviously dangerous characters
-    if any(tok in expr for tok in ["__", ";", "import", "os.", "sys.", "subprocess", "open("]):
+    # Block obviously dangerous tokens
+    if any(tok in expr for tok in ["__", ";", "import", "os.", "sys.", "subprocess", "open(", "eval", "exec"]):
         raise ValueError("Unsafe expression")
 
     allowed_names = {k: getattr(math, k) for k in dir(math) if not k.startswith("_")}
@@ -259,10 +322,8 @@ def cmd_calculate(text: str) -> Optional[Response]:
     try:
         val = safe_eval_math(expr)
         if val.is_integer():
-            spoken = f"{int(val)}"
-        else:
-            spoken = f"{val}"
-        return Response(spoken=spoken)
+            return Response(spoken=f"{int(val)}")
+        return Response(spoken=f"{val}")
     except Exception:
         return Response(spoken="I couldn't calculate that.")
 
@@ -286,8 +347,8 @@ def cmd_list_notes(_: str) -> Response:
     files = sorted(NOTES_DIR.glob("note_*.txt"), reverse=True)
     if not files:
         return Response(spoken="You have no notes yet.")
-    # Read just a preview of the latest 5
-    previews = []
+
+    previews: list[str] = []
     for fp in files[:5]:
         try:
             line = fp.read_text(encoding="utf-8").strip().splitlines()[0]
@@ -295,7 +356,7 @@ def cmd_list_notes(_: str) -> Response:
             line = "(unreadable)"
         previews.append(f"- {fp.name}: {line[:80]}")
 
-    return Response(spoken=f"Here are your latest notes.", detail="\n".join(previews))
+    return Response(spoken="Here are your latest notes.", detail="\n".join(previews))
 
 
 def cmd_shell(text: str) -> Optional[Response]:
@@ -320,7 +381,6 @@ def cmd_shell(text: str) -> Optional[Response]:
         out = out.strip()
         if not out:
             return Response(spoken="Done.")
-        # Speak a short summary; show full output in detail
         short = out.splitlines()[0][:120]
         return Response(spoken=short, detail=out)
     except subprocess.CalledProcessError as e:
@@ -329,7 +389,6 @@ def cmd_shell(text: str) -> Optional[Response]:
         return Response(spoken="I couldn't run that.", detail=str(e))
 
 
-# Router map: (predicate -> handler)
 ROUTES: Tuple[CommandHandler, ...] = (
     cmd_open,
     cmd_search,
@@ -363,11 +422,11 @@ def route(text: str) -> Response:
 # Main loop
 # -----------------------------
 
+
 def strip_wake_word(text: str) -> str:
     if not WAKE_WORD_ENABLED:
         return text
     t = text.strip().lower()
-    # Accept "jarvis ..." or "hey jarvis ..."
     t = re.sub(r"^hey\s+", "", t)
     if t.startswith(WAKE_WORD + " "):
         return t[len(WAKE_WORD) + 1 :].strip()
@@ -376,20 +435,52 @@ def strip_wake_word(text: str) -> str:
     return t
 
 
+def _load_scripted_commands_from_env() -> list[str]:
+    raw = (sys.environ.get(JARVIS_COMMANDS_ENV) if hasattr(sys, "environ") else None)  # type: ignore[attr-defined]
+    if raw is None:
+        # Fallback: os.environ is always available, but keep this safe.
+        try:
+            import os
+
+            raw = os.environ.get(JARVIS_COMMANDS_ENV)
+        except Exception:
+            raw = None
+
+    if not raw:
+        return []
+
+    # Split on semicolons; ignore empties
+    return [c.strip() for c in raw.split(";") if c.strip()]
+
+
 def main() -> int:
     speaker = Speaker()
-    listener = Listener()
+    scripted = _load_scripted_commands_from_env()
+    listener = Listener(scripted_commands=scripted)
 
     if pyttsx3 is None:
         print("[Info] pyttsx3 not installed; running without voice output.")
+
     if sr is None and not TEXT_ONLY_MODE:
-        print("[Info] SpeechRecognition not installed; switching to text-only mode.")
+        print("[Info] SpeechRecognition not installed; voice input unavailable.")
+
+    # If we have no scripted commands and no interactive stdin and no mic, exit cleanly.
+    if not scripted and TEXT_ONLY_MODE and not _stdin_is_interactive():
+        speaker.say(
+            "No interactive input is available. Set JARVIS_COMMANDS to run scripted commands, "
+            "or run this in a normal terminal."
+        )
+        return 2
 
     speaker.say("Online. Say 'help' for commands.")
 
     while True:
         raw = listener.listen()
+
+        # If nothing was captured and we were in scripted mode, end.
         if not raw:
+            if scripted and listener._script_idx >= len(scripted):
+                break
             continue
 
         text = strip_wake_word(raw)
@@ -397,7 +488,11 @@ def main() -> int:
         # If wake word is enabled and user didn't say it, ignore.
         if WAKE_WORD_ENABLED:
             lowered = raw.strip().lower()
-            if not (lowered == WAKE_WORD or lowered.startswith(WAKE_WORD + " ") or lowered.startswith("hey " + WAKE_WORD)):
+            if not (
+                lowered == WAKE_WORD
+                or lowered.startswith(WAKE_WORD + " ")
+                or lowered.startswith("hey " + WAKE_WORD)
+            ):
                 continue
 
         if not text:
@@ -415,5 +510,59 @@ def main() -> int:
     return 0
 
 
+# -----------------------------
+# Tests
+# -----------------------------
+
+
+def _run_tests() -> int:
+    import unittest
+
+    class TestMath(unittest.TestCase):
+        def test_basic(self) -> None:
+            self.assertEqual(safe_eval_math("2+2"), 4.0)
+
+        def test_functions(self) -> None:
+            self.assertAlmostEqual(safe_eval_math("sqrt(9)"), 3.0)
+            self.assertAlmostEqual(safe_eval_math("sin(pi/2)"), 1.0, places=7)
+
+        def test_blocks_names(self) -> None:
+            with self.assertRaises(ValueError):
+                safe_eval_math("os.system('rm -rf /')")
+
+        def test_blocks_dunders(self) -> None:
+            with self.assertRaises(ValueError):
+                safe_eval_math("__import__('os').system('echo hi')")
+
+    class TestWakeWord(unittest.TestCase):
+        def test_strip(self) -> None:
+            global WAKE_WORD_ENABLED
+            WAKE_WORD_ENABLED = True
+            self.assertEqual(strip_wake_word("jarvis time"), "time")
+            self.assertEqual(strip_wake_word("hey jarvis time"), "time")
+            self.assertEqual(strip_wake_word("jarvis"), "")
+
+    class TestRouting(unittest.TestCase):
+        def test_route_help(self) -> None:
+            r = route("help")
+            self.assertIn("basics", r.spoken)
+
+        def test_calculate(self) -> None:
+            r = route("calculate 12*7")
+            self.assertEqual(r.spoken, "84")
+
+    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    # Some runners don't like loadTestsFromModule inside a function; build explicitly.
+    suite = unittest.TestSuite()
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestMath))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestWakeWord))
+    suite.addTests(unittest.defaultTestLoader.loadTestsFromTestCase(TestRouting))
+
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
+    return 0 if result.wasSuccessful() else 1
+
+
 if __name__ == "__main__":
+    if "--test" in sys.argv:
+        raise SystemExit(_run_tests())
     raise SystemExit(main())
